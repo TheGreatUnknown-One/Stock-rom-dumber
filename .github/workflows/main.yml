@@ -270,64 +270,84 @@ jobs:
         if: inputs.upload_github_branch != 'true'
         run: echo "GitHub branch upload is disabled. Skipping."
 
+      - name: Resolve GitLab repo name
+        id: gitlab_repo
+        if: inputs.upload_gitlab == 'true'
+        run: |
+          set -e
+          sanitize() {
+            echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/-+/-/g; s/^-+//; s/-+$//'
+          }
+
+          readme=/tmp/final_dump/README.md
+          brand=$(awk -F': ' '/^- Brand:/{print $2; exit}' "$readme" 2>/dev/null || true)
+          code=$(awk -F': ' '/^- Codename:/{print $2; exit}' "$readme" 2>/dev/null || true)
+          [ -n "$brand" ] || brand=stock
+          [ -n "$code" ] || code='${{ inputs.device_name }}'
+
+          repo_name=$(sanitize "dump-$brand-$code")
+          [ -n "$repo_name" ] || repo_name="dump-unknown-$(date +%Y%m%d-%H%M%S)"
+
+          echo "repo_name=$repo_name" >> "$GITHUB_OUTPUT"
+          echo "Resolved GitLab repo name: $repo_name"
+
       - name: Mirror to GitLab
         if: inputs.upload_gitlab == 'true'
         env:
           GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
           GITLAB_USERNAME: ${{ secrets.GITLAB_USERNAME }}
-          GITLAB_REPO: ${{ secrets.GITLAB_REPO }}
-          GITLAB_PROJECT_PATH: ${{ secrets.GITLAB_PROJECT_PATH }}
-          GITLAB_REPO_URL: ${{ secrets.GITLAB_REPO_URL }}
         run: |
           set -e
 
           GL_TOKEN="${GITLAB_TOKEN:-}"
           GL_USER="${GITLAB_USERNAME:-}"
-          GL_REPO="${GITLAB_REPO:-}"
-          GL_PROJECT_PATH="${GITLAB_PROJECT_PATH:-}"
-          GL_REPO_URL="${GITLAB_REPO_URL:-}"
+          REPO_NAME="${{ steps.gitlab_repo.outputs.repo_name }}"
+          BRANCH="${{ steps.branch.outputs.target_branch }}"
 
           [ -n "$GL_TOKEN" ] || { echo "ERROR: Missing secret GITLAB_TOKEN"; exit 1; }
+          [ -n "$GL_USER" ] || { echo "ERROR: Missing secret GITLAB_USERNAME"; exit 1; }
 
           # Guard against placeholder values like ${GL_USER} accidentally stored in Secrets.
-          for v in "$GL_USER" "$GL_REPO" "$GL_PROJECT_PATH" "$GL_REPO_URL"; do
-            case "$v" in
-              *'${'*|*'}'*|*'$%'* )
-                echo "ERROR: Found placeholder-like text in GitLab secrets."
-                echo "Set real values only, e.g. mkpromvp or mkpromvp/Stock_room_dumb"
-                exit 1
-                ;;
-            esac
-          done
-
-          if [ -n "$GL_REPO_URL" ]; then
-            REPO_URL="$GL_REPO_URL"
-          elif [ -n "$GL_PROJECT_PATH" ]; then
-            REPO_URL="https://gitlab.com/${GL_PROJECT_PATH}.git"
-          else
-            [ -n "$GL_USER" ] || { echo "ERROR: Missing secret GITLAB_USERNAME"; exit 1; }
-            [ -n "$GL_REPO" ] || { echo "ERROR: Missing secret GITLAB_REPO"; exit 1; }
-            REPO_URL="https://gitlab.com/${GL_USER}/${GL_REPO}.git"
-          fi
-
-          REPO_URL="${REPO_URL%/}"
-          REPO_URL="${REPO_URL// /}"
-          case "$REPO_URL" in
-            *.git) ;;
-            *) REPO_URL="${REPO_URL}.git" ;;
-          esac
-
-          case "$REPO_URL" in
-            https://gitlab.com/*) ;;
-            *)
-              echo "ERROR: Invalid GitLab URL: $REPO_URL"
-              echo "Use: https://gitlab.com/<owner-or-group>/<repo>.git"
+          case "$GL_USER" in
+            *'${'*|*'}'*|*'$%'* )
+              echo "ERROR: Found placeholder-like text in GITLAB_USERNAME secret."
+              echo "Set a real value only, e.g. mkpromvp"
               exit 1
               ;;
           esac
 
+          API="https://gitlab.com/api/v4"
+
+          # Look up the project by path (namespace/repo). 404 = doesn't exist yet.
+          PROJECT_PATH_ENC=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$GL_USER/$REPO_NAME")
+
+          HTTP_CODE=$(curl -s -o /tmp/gl_project.json -w "%{http_code}" \
+            --header "PRIVATE-TOKEN: $GL_TOKEN" \
+            "$API/projects/$PROJECT_PATH_ENC")
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "GitLab repo already exists: $GL_USER/$REPO_NAME"
+          elif [ "$HTTP_CODE" = "404" ]; then
+            echo "GitLab repo not found — creating it: $REPO_NAME"
+            CREATE_CODE=$(curl -s -o /tmp/gl_create.json -w "%{http_code}" \
+              --header "PRIVATE-TOKEN: $GL_TOKEN" \
+              --header "Content-Type: application/json" \
+              --data "{\"name\": \"$REPO_NAME\", \"path\": \"$REPO_NAME\", \"visibility\": \"private\", \"initialize_with_readme\": false}" \
+              "$API/projects")
+            if [ "$CREATE_CODE" != "201" ]; then
+              echo "ERROR: Failed to create GitLab repo (HTTP $CREATE_CODE). Token needs 'api' scope."
+              cat /tmp/gl_create.json
+              exit 1
+            fi
+            echo "Created GitLab repo: $GL_USER/$REPO_NAME"
+          else
+            echo "ERROR: Unexpected response checking GitLab repo (HTTP $HTTP_CODE)"
+            cat /tmp/gl_project.json
+            exit 1
+          fi
+
+          REPO_URL="https://gitlab.com/${GL_USER}/${REPO_NAME}.git"
           AUTH_REMOTE="${REPO_URL/https:\/\//https:\/\/oauth2:${GL_TOKEN}@}"
-          BRANCH="${{ steps.branch.outputs.target_branch }}"
 
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
@@ -361,9 +381,9 @@ jobs:
 
           # Validate auth and repository path before committing big data.
           git ls-remote origin >/dev/null 2>&1 || {
-            echo "ERROR: GitLab auth/repo check failed (403 غالبا token scope أو repo path غلط)."
+            echo "ERROR: GitLab auth/repo check failed after creation (403 غالبا token scope غلط)."
             echo "Expected repo URL: $REPO_URL"
-            echo "Required token scope: write_repository"
+            echo "Required token scope: api"
             exit 1
           }
 
