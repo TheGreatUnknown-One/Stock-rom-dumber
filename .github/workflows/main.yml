@@ -340,6 +340,7 @@ jobs:
               exit 1
             fi
             echo "Created GitLab repo: $GL_USER/$REPO_NAME"
+            sleep 5
           else
             echo "ERROR: Unexpected response checking GitLab repo (HTTP $HTTP_CODE)"
             cat /tmp/gl_project.json
@@ -380,12 +381,24 @@ jobs:
           git remote add origin "$AUTH_REMOTE"
 
           # Validate auth and repository path before committing big data.
-          git ls-remote origin >/dev/null 2>&1 || {
-            echo "ERROR: GitLab auth/repo check failed after creation (403 غالبا token scope غلط)."
+          # A freshly created GitLab project can take a few seconds for its
+          # git backend (Gitaly) to become reachable, so retry with backoff
+          # instead of failing on the first attempt.
+          LS_OK=false
+          for i in 1 2 3 4 5; do
+            if git ls-remote origin >/dev/null 2>&1; then
+              LS_OK=true
+              break
+            fi
+            echo "git ls-remote attempt $i failed, retrying in $((i * 3))s..."
+            sleep $((i * 3))
+          done
+          if [ "$LS_OK" != "true" ]; then
+            echo "ERROR: GitLab auth/repo check failed after creation (403/404 غالبا token scope غلط أو الريبو لسه بيتجهز)."
             echo "Expected repo URL: $REPO_URL"
             echo "Required token scope: api"
             exit 1
-          }
+          fi
 
           find . -type f -name '*.apk' -size +100M -delete 2>/dev/null || true
 
