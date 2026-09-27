@@ -295,28 +295,32 @@ jobs:
         if: inputs.upload_gitlab == 'true'
         env:
           GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
-          GITLAB_USERNAME: ${{ secrets.GITLAB_USERNAME }}
         run: |
           set -e
 
           GL_TOKEN="${GITLAB_TOKEN:-}"
-          GL_USER="${GITLAB_USERNAME:-}"
           REPO_NAME="${{ steps.gitlab_repo.outputs.repo_name }}"
           BRANCH="${{ steps.branch.outputs.target_branch }}"
 
           [ -n "$GL_TOKEN" ] || { echo "ERROR: Missing secret GITLAB_TOKEN"; exit 1; }
-          [ -n "$GL_USER" ] || { echo "ERROR: Missing secret GITLAB_USERNAME"; exit 1; }
-
-          # Guard against placeholder values like ${GL_USER} accidentally stored in Secrets.
-          case "$GL_USER" in
-            *'${'*|*'}'*|*'$%'* )
-              echo "ERROR: Found placeholder-like text in GITLAB_USERNAME secret."
-              echo "Set a real value only, e.g. mkpromvp"
-              exit 1
-              ;;
-          esac
 
           API="https://gitlab.com/api/v4"
+
+          # Resolve the real username tied to this token instead of trusting a
+          # secret that could drift out of sync with it — this guarantees the
+          # existence check below and the actual project creation always land
+          # on the exact same namespace path.
+          ME_CODE=$(curl -s -o /tmp/gl_me.json -w "%{http_code}" \
+            --header "PRIVATE-TOKEN: $GL_TOKEN" \
+            "$API/user")
+          if [ "$ME_CODE" != "200" ]; then
+            echo "ERROR: Could not resolve GitLab identity for this token (HTTP $ME_CODE)."
+            cat /tmp/gl_me.json
+            exit 1
+          fi
+          GL_USER=$(jq -r '.username' /tmp/gl_me.json)
+          [ -n "$GL_USER" ] && [ "$GL_USER" != "null" ] || { echo "ERROR: Could not parse GitLab username from token."; exit 1; }
+          echo "Resolved GitLab username from token: $GL_USER"
 
           # Look up the project by path (namespace/repo). 404 = doesn't exist yet.
           PROJECT_PATH_ENC=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$GL_USER/$REPO_NAME")
@@ -334,13 +338,18 @@ jobs:
               --header "Content-Type: application/json" \
               --data "{\"name\": \"$REPO_NAME\", \"path\": \"$REPO_NAME\", \"visibility\": \"private\", \"initialize_with_readme\": false}" \
               "$API/projects")
-            if [ "$CREATE_CODE" != "201" ]; then
+            if [ "$CREATE_CODE" = "400" ] && grep -q "has already been taken" /tmp/gl_create.json; then
+              # Race/drift: it exists after all (e.g. created moments ago by a
+              # concurrent run) — treat it as found rather than failing.
+              echo "GitLab repo already existed (creation reported 'already taken') — continuing."
+            elif [ "$CREATE_CODE" != "201" ]; then
               echo "ERROR: Failed to create GitLab repo (HTTP $CREATE_CODE). Token needs 'api' scope."
               cat /tmp/gl_create.json
               exit 1
+            else
+              echo "Created GitLab repo: $GL_USER/$REPO_NAME"
+              sleep 5
             fi
-            echo "Created GitLab repo: $GL_USER/$REPO_NAME"
-            sleep 5
           else
             echo "ERROR: Unexpected response checking GitLab repo (HTTP $HTTP_CODE)"
             cat /tmp/gl_project.json
